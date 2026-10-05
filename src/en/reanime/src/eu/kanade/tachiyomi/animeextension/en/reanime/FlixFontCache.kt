@@ -22,7 +22,6 @@ object FlixFontCache {
     private const val TAG = "ReAnimeFonts"
     private const val MAX_FONT_BYTES = 25L * 1024 * 1024
     private const val MAX_TOTAL_CACHE_BYTES = 50L * 1024 * 1024
-    private const val MAX_FONT_AGE_MS = 7L * 24 * 60 * 60 * 1000
 
     // Full per-file vault URLs, e.g. https://vault-95.../fonts/<fileId>/<name>.
     private val FONT_URL_REGEX =
@@ -145,11 +144,15 @@ object FlixFontCache {
         if (cached.length() <= 0) download(client, fontHeaders, font, cached)
         if (cached.length() <= 0) return
 
-        // Copy to mpv/fonts if missing or file content differs
+        // Copy to mpv/fonts if missing or file content differs; refresh timestamp if already present
         val installed = File(mpvFontsDir, font.name)
+        val now = System.currentTimeMillis()
         if (!installed.isFile || !installed.contentEquals(cached)) {
             cached.copyTo(installed, overwrite = true)
             Log.i(TAG, "Installed font: ${font.name}")
+        } else {
+            installed.setLastModified(now)
+            cached.setLastModified(now)
         }
     }
 
@@ -215,22 +218,18 @@ object FlixFontCache {
     }
 
     private fun cleanOldFonts(cacheRoot: File, mpvFontsDir: File) {
-        val now = System.currentTimeMillis()
         try {
-            listOf(cacheRoot, mpvFontsDir).forEach { dir ->
-                dir.walkTopDown().filter { it.isFile }.forEach { file ->
-                    if (now - file.lastModified() > MAX_FONT_AGE_MS) {
-                        file.delete()
-                    }
-                }
-            }
+            val allFiles = listOf(cacheRoot, mpvFontsDir)
+                .flatMap { dir -> dir.walkTopDown().filter { it.isFile }.toList() }
+                .sortedBy { it.lastModified() } // Least recently used first
 
-            val files = cacheRoot.walkTopDown().filter { it.isFile }.sortedBy { it.lastModified() }.toList()
-            var totalSize = files.sumOf { it.length() }
-            for (file in files) {
+            var totalSize = allFiles.sumOf { it.length() }
+            for (file in allFiles) {
                 if (totalSize <= MAX_TOTAL_CACHE_BYTES) break
-                totalSize -= file.length()
-                file.delete()
+                val size = file.length()
+                if (file.delete()) {
+                    totalSize -= size
+                }
             }
         } catch (e: Exception) {
             Log.w(TAG, "Font cache cleanup failed: $e")
