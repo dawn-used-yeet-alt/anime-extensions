@@ -1,24 +1,30 @@
 package eu.kanade.tachiyomi.animeextension.en.reanime
 
 import android.util.Log
+import eu.kanade.tachiyomi.network.awaitSuccess
 import keiyoushi.utils.applicationContext
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.withContext
 import okhttp3.Headers
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.net.URLDecoder
+import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
 
-// Downloads the ASS fonts listed in the embed page's extracted_fonts[] into
-// mpv's fonts dir, so HLS subtitles render with the same glyphs as the MKV.
+// Downloads the ASS fonts in the embed page's extracted_fonts[] into
+// mpv's fonts dir, so HLS subtitles render with the right positioning.
 object FlixFontCache {
 
     private const val TAG = "ReAnimeFonts"
     private const val MAX_FONT_BYTES = 25L * 1024 * 1024
+    private const val MAX_TOTAL_CACHE_BYTES = 50L * 1024 * 1024
+    private const val MAX_FONT_AGE_MS = 7L * 24 * 60 * 60 * 1000
 
     // Full per-file vault URLs, e.g. https://vault-95.../fonts/<fileId>/<name>.
-    // The vault host changes per file, so these are used as-is.
     private val FONT_URL_REGEX =
         Regex("""(https://[^"'\s)]+/fonts/([0-9a-fA-F-]{36})/([^"'\s)]+))""")
 
@@ -38,9 +44,9 @@ object FlixFontCache {
         html: String,
         embedJson: String,
         subtitleUrls: List<String>,
-    ) {
+    ) = withContext(Dispatchers.IO) {
         val fonts = collectFonts(html, embedJson, subtitleUrls)
-        if (fonts.isEmpty()) return
+        if (fonts.isEmpty()) return@withContext
 
         val mpvFontsDir: File
         val cacheRoot: File
@@ -50,14 +56,21 @@ object FlixFontCache {
             cacheRoot = File(appContext.cacheDir, "reanime-fonts").apply { mkdirs() }
         } catch (e: Exception) {
             Log.w(TAG, "Cannot resolve app dirs: $e")
-            return
+            return@withContext
         }
+
+        cleanOldFonts(cacheRoot, mpvFontsDir)
+
+        val fontClient = client.newBuilder()
+            .readTimeout(10, TimeUnit.SECONDS)
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .build()
 
         supervisorScope {
             fonts.map { font ->
-                async {
+                async(Dispatchers.IO) {
                     try {
-                        ensureFont(client, fontHeaders, cacheRoot, mpvFontsDir, font)
+                        ensureFont(fontClient, fontHeaders, cacheRoot, mpvFontsDir, font)
                     } catch (e: Exception) {
                         Log.w(TAG, "Font failed: ${font.name}: $e")
                     }
@@ -95,7 +108,7 @@ object FlixFontCache {
                 EXTRACTED_FONTS_REGEX.findAll(source).forEach { block ->
                     FONT_NAME_REGEX.findAll(block.groupValues[1]).forEach { match ->
                         sanitize(match.groupValues[1].trim())?.let { name ->
-                            val encoded = java.net.URLEncoder.encode(name, "UTF-8").replace("+", "%20")
+                            val encoded = URLEncoder.encode(name, "UTF-8").replace("+", "%20")
                             found.add(Font("$vaultHost/fonts/$fileId/$encoded", fileId, name))
                         }
                     }
@@ -106,11 +119,11 @@ object FlixFontCache {
         return found.toList()
     }
 
-    private fun decode(raw: String): String =
-        runCatching { URLDecoder.decode(raw.trim(), "UTF-8").trim() }.getOrNull().orEmpty()
+    private fun decode(raw: String): String = runCatching { URLDecoder.decode(raw.trim(), "UTF-8").trim() }.getOrNull().orEmpty()
 
     private fun sanitize(raw: String): String? {
-        val name = raw.substringAfterLast('/').substringAfterLast('\\').trim()
+        val clean = raw.substringBefore('?')
+        val name = clean.substringAfterLast('/').substringAfterLast('\\').trim()
         if (name.isEmpty() || name.length > 128 || ".." in name) return null
         if (!name.endsWith(".ttf", ignoreCase = true) &&
             !name.endsWith(".otf", ignoreCase = true) &&
@@ -121,7 +134,7 @@ object FlixFontCache {
         return name
     }
 
-    private fun ensureFont(
+    private suspend fun ensureFont(
         client: OkHttpClient,
         fontHeaders: Headers,
         cacheRoot: File,
@@ -132,8 +145,7 @@ object FlixFontCache {
         if (cached.length() <= 0) download(client, fontHeaders, font, cached)
         if (cached.length() <= 0) return
 
-        // Animiru wipes this dir on every resume, so copy back when missing.
-        // On name clashes the current episode wins.
+        // Copy to mpv/fonts if missing or size differs
         val installed = File(mpvFontsDir, font.name)
         if (!installed.isFile || installed.length() != cached.length()) {
             cached.copyTo(installed, overwrite = true)
@@ -141,7 +153,7 @@ object FlixFontCache {
         }
     }
 
-    private fun download(
+    private suspend fun download(
         client: OkHttpClient,
         fontHeaders: Headers,
         font: Font,
@@ -150,10 +162,13 @@ object FlixFontCache {
         if (!font.url.startsWith("https://")) return
         val dir = target.parentFile ?: return
         dir.mkdirs()
-        val tmp = File(dir, "${target.name}.tmp")
+
+        val tmp = withContext(Dispatchers.IO) {
+            File.createTempFile("font_", ".tmp", dir)
+        }
         try {
             client.newCall(Request.Builder().url(font.url).headers(fontHeaders).build())
-                .execute().use { response ->
+                .awaitSuccess().use { response ->
                     if (!response.isSuccessful) {
                         Log.w(TAG, "Font HTTP ${response.code}: ${font.name}")
                         return
@@ -186,6 +201,29 @@ object FlixFontCache {
                 }
         } finally {
             tmp.delete()
+        }
+    }
+
+    private fun cleanOldFonts(cacheRoot: File, mpvFontsDir: File) {
+        val now = System.currentTimeMillis()
+        try {
+            listOf(cacheRoot, mpvFontsDir).forEach { dir ->
+                dir.walkTopDown().filter { it.isFile }.forEach { file ->
+                    if (now - file.lastModified() > MAX_FONT_AGE_MS) {
+                        file.delete()
+                    }
+                }
+            }
+
+            val files = cacheRoot.walkTopDown().filter { it.isFile }.sortedBy { it.lastModified() }.toList()
+            var totalSize = files.sumOf { it.length() }
+            for (file in files) {
+                if (totalSize <= MAX_TOTAL_CACHE_BYTES) break
+                totalSize -= file.length()
+                file.delete()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Font cache cleanup failed: $e")
         }
     }
 }
