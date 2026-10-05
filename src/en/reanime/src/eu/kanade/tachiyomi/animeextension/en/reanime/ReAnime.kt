@@ -852,6 +852,14 @@ class ReAnime :
 
             val skipTimes = embedDataDto.toSkipTimes()
 
+            // HLS serves the same .ass files without the MKV's embedded fonts,
+            // which breaks positioned karaoke. Seed mpv's fonts dir now, before
+            // playback starts. Best-effort: playback continues without them.
+            try {
+                FlixFontCache.ensureFonts(client, flixHeaders, html, rawJson, subtitleTracks.map { it.url })
+            } catch (_: Exception) {
+            }
+
             // Strip subtitles/chapters from the payload (enc-dec.app doesn't need them)
             val embedData = try {
                 val obj = rawJson.parseAs<JsonObject>().toMutableMap()
