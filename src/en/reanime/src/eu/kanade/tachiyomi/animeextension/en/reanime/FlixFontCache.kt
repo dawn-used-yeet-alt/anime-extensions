@@ -145,11 +145,21 @@ object FlixFontCache {
         if (cached.length() <= 0) download(client, fontHeaders, font, cached)
         if (cached.length() <= 0) return
 
-        // Copy to mpv/fonts if missing or size differs
+        // Copy to mpv/fonts if missing or file content differs
         val installed = File(mpvFontsDir, font.name)
-        if (!installed.isFile || installed.length() != cached.length()) {
+        if (!installed.isFile || !installed.contentEquals(cached)) {
             cached.copyTo(installed, overwrite = true)
             Log.i(TAG, "Installed font: ${font.name}")
+        }
+    }
+
+    private fun File.contentEquals(other: File): Boolean {
+        if (!this.exists() || !other.exists()) return false
+        if (this.length() != other.length()) return false
+        return try {
+            this.readBytes().contentEquals(other.readBytes())
+        } catch (_: Exception) {
+            false
         }
     }
 
