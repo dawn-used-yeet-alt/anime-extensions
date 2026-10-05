@@ -31,8 +31,11 @@ import keiyoushi.utils.parallelCatchingFlatMap
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonBody
 import keiyoushi.utils.tryParse
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonObject
@@ -853,11 +856,13 @@ class ReAnime :
             val skipTimes = embedDataDto.toSkipTimes()
 
             // HLS serves the same .ass files without the MKV's embedded fonts,
-            // which breaks positioned karaoke. Seed mpv's fonts dir now, before
-            // playback starts. Best-effort: playback continues without them.
-            try {
-                FlixFontCache.ensureFonts(client, flixHeaders, html, rawJson, subtitleTracks.map { it.url })
-            } catch (_: Exception) {
+            // which breaks positioned karaoke. Seed mpv's fonts dir in the background
+            // before playback starts.
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    FlixFontCache.ensureFonts(client, flixHeaders, html, rawJson, subtitleTracks.map { it.url })
+                } catch (_: Exception) {
+                }
             }
 
             // Strip subtitles/chapters from the payload (enc-dec.app doesn't need them)
